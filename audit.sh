@@ -1,0 +1,382 @@
+#!/bin/bash
+# VPS Security Audit Script (run from macOS)
+# Usage: ./audit.sh paul phantom
+# Requires: ssh, optional: nmap
+
+set -euo pipefail
+
+SSH_USER="${1:-paul}"
+VPS_HOST="${2:-phantom}"
+
+# SSH options to suppress MOTD and banners
+# Note: PrintMotd is not available on all SSH clients, so we filter MOTD in parsing
+SSH_OPTS="-o LogLevel=ERROR -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+PASSED=0
+FAILED=0
+WARNINGS=0
+FAILED_ITEMS=()
+WARNED_ITEMS=()
+PASSED_ITEMS=()
+
+check_pass() {
+  echo "[OK] $1"
+  ((PASSED++)) || true
+  PASSED_ITEMS+=("$1")
+}
+
+check_fail() {
+  echo "[FAIL] $1"
+  ((FAILED++)) || true
+  FAILED_ITEMS+=("$1")
+}
+
+check_warn() {
+  echo "[WARN] $1"
+  ((WARNINGS++)) || true
+  WARNED_ITEMS+=("$1")
+}
+
+echo "[INFO] Auditing $SSH_USER@$VPS_HOST"
+echo
+
+# ======================
+# SSH CONNECTIVITY
+# ======================
+echo "[INFO] Testing SSH connectivity..."
+if ssh $SSH_OPTS -o BatchMode=yes -o ConnectTimeout=5 "$SSH_USER@$VPS_HOST" "echo OK" >/dev/null 2>&1; then
+  check_pass "SSH connection successful"
+else
+  check_fail "Cannot SSH into $SSH_USER@$VPS_HOST"
+  exit 1
+fi
+echo
+
+# ======================
+# SSH HARDENING CHECK
+# ======================
+echo "[INFO] Checking SSH hardening..."
+SSH_CHECKS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+set -e
+SSHD_CONF=$(sudo sshd -T 2>/dev/null || echo "")
+
+if [ -z "$SSHD_CONF" ]; then
+  echo "ERROR: Could not get SSH config"
+  exit 1
+fi
+
+PERMIT_ROOT=$(echo "$SSHD_CONF" | grep -i "^permitrootlogin" | awk '{print $2}' || echo "unknown")
+PASSWORD_AUTH=$(echo "$SSHD_CONF" | grep -i "^passwordauthentication" | awk '{print $2}' || echo "unknown")
+CHALLENGE_RESP=$(echo "$SSHD_CONF" | grep -i "^challengeresponseauthentication" | awk '{print $2}' || echo "unknown")
+ALLOW_USERS=$(echo "$SSHD_CONF" | grep -i "^allowusers" | awk '{print $2}' || echo "not set")
+USE_DNS=$(echo "$SSHD_CONF" | grep -i "^usedns" | awk '{print $2}' || echo "unknown")
+
+echo "PERMIT_ROOT=$PERMIT_ROOT"
+echo "PASSWORD_AUTH=$PASSWORD_AUTH"
+echo "CHALLENGE_RESP=$CHALLENGE_RESP"
+echo "ALLOW_USERS=$ALLOW_USERS"
+echo "USE_DNS=$USE_DNS"
+EOF
+)
+
+PERMIT_ROOT=$(echo "$SSH_CHECKS" | grep "^PERMIT_ROOT=" | cut -d= -f2)
+PASSWORD_AUTH=$(echo "$SSH_CHECKS" | grep "^PASSWORD_AUTH=" | cut -d= -f2)
+CHALLENGE_RESP=$(echo "$SSH_CHECKS" | grep "^CHALLENGE_RESP=" | cut -d= -f2)
+ALLOW_USERS=$(echo "$SSH_CHECKS" | grep "^ALLOW_USERS=" | cut -d= -f2)
+USE_DNS=$(echo "$SSH_CHECKS" | grep "^USE_DNS=" | cut -d= -f2)
+
+echo "PermitRootLogin: $PERMIT_ROOT"
+if [ "$PERMIT_ROOT" = "no" ]; then
+  check_pass "Root login disabled"
+else
+  check_fail "Root login is enabled (should be 'no')"
+fi
+
+echo "PasswordAuthentication: $PASSWORD_AUTH"
+if [ "$PASSWORD_AUTH" = "no" ]; then
+  check_pass "Password authentication disabled"
+else
+  check_fail "Password authentication enabled (should be 'no')"
+fi
+
+echo "ChallengeResponseAuthentication: $CHALLENGE_RESP"
+if [ "$CHALLENGE_RESP" = "no" ] || [ -z "$CHALLENGE_RESP" ]; then
+  check_pass "Challenge-response authentication disabled"
+else
+  check_warn "Challenge-response authentication enabled (should be 'no')"
+fi
+
+echo "AllowUsers: $ALLOW_USERS"
+if [ "$ALLOW_USERS" = "$SSH_USER" ]; then
+  check_pass "AllowUsers restricts access to $SSH_USER"
+elif [ "$ALLOW_USERS" = "not set" ]; then
+  check_warn "AllowUsers not configured"
+else
+  check_warn "AllowUsers set to: $ALLOW_USERS"
+fi
+
+echo "UseDNS: $USE_DNS"
+if [ "$USE_DNS" = "no" ]; then
+  check_pass "UseDNS disabled (faster connections)"
+else
+  check_warn "UseDNS enabled (may slow connections)"
+fi
+
+echo
+
+# ======================
+# FIREWALL STATUS
+# ======================
+echo "[INFO] Checking firewall (ufw)..."
+UFW_STATUS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" "sudo ufw status verbose 2>/dev/null" || echo "")
+if echo "$UFW_STATUS" | grep -q "Status: active"; then
+  check_pass "UFW firewall is active"
+  echo "$UFW_STATUS"
+  if echo "$UFW_STATUS" | grep -q "OpenSSH"; then
+    check_pass "OpenSSH allowed in firewall"
+  else
+    check_fail "OpenSSH not explicitly allowed in firewall"
+  fi
+else
+  check_fail "UFW firewall is NOT active"
+fi
+echo
+
+# ======================
+# FAIL2BAN STATUS
+# ======================
+echo "[INFO] Checking Fail2Ban..."
+FAIL2BAN_STATUS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+if systemctl is-active --quiet fail2ban 2>/dev/null; then
+  echo "ACTIVE"
+  echo "===FAIL2BAN_OUTPUT_START==="
+  sudo fail2ban-client status sshd 2>/dev/null || echo "NO_JAIL"
+  echo "===FAIL2BAN_OUTPUT_END==="
+else
+  echo "INACTIVE"
+fi
+EOF
+)
+
+if echo "$FAIL2BAN_STATUS" | grep -q "ACTIVE"; then
+  check_pass "Fail2Ban is running"
+  # Extract only the Fail2Ban status output between markers
+  echo "$FAIL2BAN_STATUS" | sed -n '/===FAIL2BAN_OUTPUT_START===/,/===FAIL2BAN_OUTPUT_END===/p' | grep -v "===" | grep -v "^$" || true
+  if echo "$FAIL2BAN_STATUS" | grep -q "NO_JAIL"; then
+    check_warn "Fail2Ban active but sshd jail not configured"
+  fi
+else
+  check_fail "Fail2Ban is NOT running"
+fi
+echo
+
+# ======================
+# UNATTENDED UPGRADES
+# ======================
+echo "[INFO] Checking unattended upgrades..."
+UNATTENDED_STATUS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+  echo "ENABLED"
+  if systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
+    echo "ACTIVE"
+  fi
+else
+  echo "DISABLED"
+fi
+EOF
+)
+
+if echo "$UNATTENDED_STATUS" | grep -q "ENABLED"; then
+  check_pass "Unattended upgrades enabled"
+  if echo "$UNATTENDED_STATUS" | grep -q "ACTIVE"; then
+    check_pass "Unattended upgrades service active"
+  else
+    check_warn "Unattended upgrades enabled but service not active"
+  fi
+else
+  check_fail "Unattended upgrades NOT enabled"
+fi
+echo
+
+# ======================
+# SYSTEM UPDATES
+# ======================
+echo "[INFO] Checking for available security updates..."
+UPDATE_STATUS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+apt list --upgradable 2>/dev/null | grep -c "security" || echo "0"
+EOF
+)
+
+# Clean the output - remove any non-numeric characters
+UPDATE_COUNT=$(echo "$UPDATE_STATUS" | tr -d '[:space:]' | grep -oE '^[0-9]+' || echo "0")
+
+if [ "$UPDATE_COUNT" -eq 0 ]; then
+  check_pass "No pending security updates"
+else
+  check_warn "$UPDATE_COUNT security update(s) available"
+fi
+echo
+
+# ======================
+# DOCKER SECURITY
+# ======================
+echo "[INFO] Checking Docker security..."
+DOCKER_CHECKS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+if command -v docker >/dev/null 2>&1; then
+  echo "INSTALLED"
+  docker version --format '{{.Server.Version}}' 2>/dev/null | head -1 || echo "ERROR"
+  
+  if [ -f /etc/docker/daemon.json ]; then
+    echo "DAEMON_JSON_EXISTS"
+    cat /etc/docker/daemon.json
+  else
+    echo "NO_DAEMON_JSON"
+  fi
+  
+  # Check if user namespace remap is active
+  if docker info 2>/dev/null | grep -q "userns"; then
+    echo "USERNS_ENABLED"
+  else
+    echo "USERNS_DISABLED"
+  fi
+else
+  echo "NOT_INSTALLED"
+fi
+EOF
+)
+
+if echo "$DOCKER_CHECKS" | grep -q "INSTALLED"; then
+  # Extract Docker version - get first line that looks like a version number
+  DOCKER_VERSION=$(echo "$DOCKER_CHECKS" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+  if [ -n "$DOCKER_VERSION" ] && [ "$DOCKER_VERSION" != "ERROR" ]; then
+    check_pass "Docker installed (version: $DOCKER_VERSION)"
+  else
+    check_pass "Docker installed"
+  fi
+  
+  if echo "$DOCKER_CHECKS" | grep -q "DAEMON_JSON_EXISTS"; then
+    check_pass "Docker daemon.json exists"
+    echo "$DOCKER_CHECKS" | grep -A 10 "DAEMON_JSON_EXISTS" | grep -v "DAEMON_JSON_EXISTS" | head -5
+    
+    if echo "$DOCKER_CHECKS" | grep -q "userns-remap"; then
+      check_pass "Docker user namespace remap configured"
+    else
+      check_warn "Docker user namespace remap not configured in daemon.json"
+    fi
+    
+    if echo "$DOCKER_CHECKS" | grep -q "log-driver"; then
+      check_pass "Docker log driver configured"
+    else
+      check_warn "Docker log driver not configured"
+    fi
+  else
+    check_warn "Docker daemon.json not found"
+  fi
+  
+  if echo "$DOCKER_CHECKS" | grep -q "USERNS_ENABLED"; then
+    check_pass "Docker user namespace remap active"
+  elif echo "$DOCKER_CHECKS" | grep -q "USERNS_DISABLED"; then
+    check_warn "Docker user namespace remap not active"
+  fi
+  
+  # Check if user is in docker group
+  if ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" "groups" 2>/dev/null | grep -q "docker"; then
+    check_pass "User $SSH_USER is in docker group"
+  else
+    check_warn "User $SSH_USER is NOT in docker group"
+  fi
+else
+  check_warn "Docker not installed"
+fi
+echo
+
+# ======================
+# TIMEZONE & NTP
+# ======================
+echo "[INFO] Checking timezone and NTP..."
+TIMEZONE_CHECKS=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" <<'EOF'
+timedatectl show --property=Timezone --value 2>/dev/null || echo "unknown"
+systemctl is-active --quiet ntp 2>/dev/null && echo "NTP_ACTIVE" || echo "NTP_INACTIVE"
+EOF
+)
+
+# Extract timezone - should be a single line like "Europe/Amsterdam"
+TIMEZONE=$(echo "$TIMEZONE_CHECKS" | grep -v "NTP" | grep -E "^[A-Za-z]+/[A-Za-z_]+$" | head -1)
+if [ -n "$TIMEZONE" ] && [ "$TIMEZONE" != "unknown" ]; then
+  check_pass "Timezone configured: $TIMEZONE"
+else
+  check_warn "Timezone not configured"
+fi
+
+if echo "$TIMEZONE_CHECKS" | grep -q "NTP_ACTIVE"; then
+  check_pass "NTP service active"
+else
+  check_warn "NTP service not active"
+fi
+echo
+
+# ======================
+# SYSTEM EXPOSURE CHECKS
+# ======================
+echo "[INFO] Checking for listening services..."
+LISTENING=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" "sudo ss -tulpen 2>/dev/null" || echo "")
+if [ -n "$LISTENING" ]; then
+  echo "$LISTENING"
+  # Count non-SSH listening ports, excluding common system services (DNS, NTP)
+  # Use awk to count unique LISTEN lines excluding ports 22, 53, 123
+  NON_SSH_COUNT=$(echo "$LISTENING" | awk '/LISTEN/ && !/:22[^0-9]/ && !/:53[^0-9]/ && !/:123[^0-9]/ {count++} END {print count+0}')
+  if [ "${NON_SSH_COUNT:-0}" -eq 0 ]; then
+    check_pass "Only SSH and essential system services (DNS, NTP) are listening"
+  else
+    check_warn "$NON_SSH_COUNT non-SSH service(s) listening (excluding DNS/NTP)"
+  fi
+else
+  check_warn "Could not retrieve listening services"
+fi
+echo
+
+# ======================
+# SUMMARY
+# ======================
+echo "=========================================="
+echo "[SUMMARY] Security audit completed"
+echo "=========================================="
+echo "✔ Passed:  $PASSED"
+echo "✗ Failed:  $FAILED"
+echo "⚠ Warnings: $WARNINGS"
+echo
+
+if [ "$PASSED" -gt 0 ]; then
+  echo "[PASSED]"
+  for item in "${PASSED_ITEMS[@]}"; do
+    echo "  ✔ $item"
+  done
+  echo
+fi
+
+if [ "$FAILED" -gt 0 ]; then
+  echo "[FAILURES]"
+  for item in "${FAILED_ITEMS[@]}"; do
+    echo "  ✗ $item"
+  done
+  echo
+fi
+
+if [ "$WARNINGS" -gt 0 ]; then
+  echo "[WARNINGS]"
+  for item in "${WARNED_ITEMS[@]}"; do
+    echo "  ⚠ $item"
+  done
+  echo
+fi
+
+if [ "$FAILED" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+  echo "[SUCCESS] All security checks passed!"
+  exit 0
+elif [ "$FAILED" -eq 0 ]; then
+  echo "[INFO] All critical checks passed, but some warnings to review."
+  exit 0
+else
+  echo "[ALERT] Some security checks failed. Please review and fix."
+  exit 1
+fi
