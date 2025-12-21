@@ -352,11 +352,17 @@ if [ -n "$LISTENING" ]; then
       else if ($1 ~ /^udp/) proto = "UDP"
       else proto = toupper($1)
       # Extract process name if available
-      if (match($0, /users:\(\([^)]+\)/)) {
-        proc_str = substr($0, RSTART+7, RLENGTH-7)
-        gsub(/".*"/, "", proc_str)
-        proc = proc_str
-        printf "  %s:%s (%s)\n", proto, port, proc
+      if (match($0, /users:\(\(/)) {
+        # Extract the content inside users:(("processname",...))
+        start = RSTART + 7
+        rest = substr($0, start)
+        # Find the quoted process name
+        if (match(rest, /"([^"]+)"/)) {
+          proc = substr(rest, RSTART + 1, RLENGTH - 2)
+          printf "  %s:%s (%s)\n", proto, port, proc
+        } else {
+          printf "  %s:%s\n", proto, port
+        }
       } else {
         printf "  %s:%s\n", proto, port
       }
@@ -371,11 +377,48 @@ if [ -n "$LISTENING" ]; then
   echo
   
   # Count non-SSH listening ports, excluding common system services (DNS, NTP)
-  NON_SSH_COUNT=$(echo "$LISTENING" | awk '/LISTEN/ && !/:22[^0-9]/ && !/:53[^0-9]/ && !/:123[^0-9]/ {count++} END {print count+0}')
+  # Reuse the OPEN_PORTS data to get process names
+  NON_SSH_PORTS=$(echo "$OPEN_PORTS" | awk '
+    /^  (TCP|UDP):/ {
+      # Extract protocol and port using standard awk (no capture groups)
+      if (match($0, /^  (TCP|UDP):[0-9]+/)) {
+        # Extract the matched portion and split it
+        matched = substr($0, RSTART, RLENGTH)
+        gsub(/^  /, "", matched)
+        split(matched, parts, ":")
+        proto = parts[1]
+        port = parts[2]
+        proc = "unknown"
+        # Extract process name from parentheses if present
+        if (match($0, /\([^)]+\)/)) {
+          proc = substr($0, RSTART + 1, RLENGTH - 2)
+        }
+        # Skip SSH (22), DNS (53), NTP (123)
+        if (port != 22 && port != 53 && port != 123) {
+          key = proto ":" port
+          # Store the process name for this port (keep first one found if duplicates)
+          if (!(key in ports)) {
+            ports[key] = proc
+          }
+        }
+      }
+    }
+    END {
+      for (p in ports) {
+        printf "    - %s", p
+        if (ports[p] != "unknown") printf " (%s)", ports[p]
+        printf "\n"
+      }
+    }
+  ')
+  
+  # Count unique non-SSH ports (matching what we display)
+  NON_SSH_COUNT=$(echo "$NON_SSH_PORTS" | grep -c "^    -" || echo "0")
   if [ "${NON_SSH_COUNT:-0}" -eq 0 ]; then
     check_pass "Only SSH and essential system services (DNS, NTP) are listening"
   else
-    check_warn "$NON_SSH_COUNT non-SSH service(s) listening (excluding DNS/NTP)"
+    check_warn "$NON_SSH_COUNT additional service(s) listening on ports:
+$NON_SSH_PORTS"
   fi
 else
   check_warn "Could not retrieve listening services"
