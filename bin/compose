@@ -44,7 +44,7 @@ ssh_exec() {
     exit 1
   fi
   
-  ssh "${VPS_USER}@${VPS_HOST}" "$@"
+  ssh -A "${VPS_USER}@${VPS_HOST}" "$@"
 }
 
 # ======================
@@ -69,12 +69,20 @@ Commands:
   init <name>                    Initialize a new docker-compose project
   add <project> <type> <alias>   Add a container to a project
                                  Types: bun, mysql
+  clone <project> <alias> <url>  Clone a Git repository into ~/apps/<project>/apps/<alias>
+  up <project>                   Start a docker-compose project
+  down <project>                 Stop and remove a docker-compose project
+  restart <project>              Restart a docker-compose project
 
 Examples:
   export VPS_HOST=192.168.1.100
   $0 init myapp
   $0 add myapp bun app
   $0 add myapp mysql db
+  $0 clone myapp app https://github.com/user/repo.git
+  $0 up myapp
+  $0 down myapp
+  $0 restart myapp
 EOF
   exit 1
 }
@@ -104,15 +112,12 @@ init_project() {
   ssh_exec "mkdir -p \"${project_dir}\""
   
   ssh_exec "cat > \"${project_dir}/docker-compose.yml\"" <<EOF
-version: '3.8'
-
 services:
   # Add your services here using: $0 add $project_name <type> <alias>
 
 networks:
   default:
     name: ${project_name}_network
-
 EOF
   
   echo "[OK] Project initialized on VPS at: ${project_dir}"
@@ -123,14 +128,17 @@ EOF
 # FUNCTION: GET BUN SERVICE CONFIG
 # ======================
 get_bun_service() {
-  local alias="$1"
+  local project_name="$1"
+  local alias="$2"
+  local compose_home="$(get_compose_home)"
+  local app_dir="${compose_home}/${project_name}/apps/${alias}"
   cat <<EOF
   ${alias}:
     image: oven/bun:latest
     container_name: ${alias}
     working_dir: /app
     volumes:
-      - ./:/app
+      - ${app_dir}:/app
     command: bun run --watch src/index.ts
     networks:
       - default
@@ -165,7 +173,7 @@ get_mysql_service() {
       - default
     restart: unless-stopped
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
@@ -212,9 +220,14 @@ add_service() {
   
   # Get service config based on type
   local service_config=""
-  case "${service_type,,}" in
+  local service_type_lower=$(echo "$service_type" | tr '[:upper:]' '[:lower:]')
+  case "$service_type_lower" in
     bun)
-      service_config=$(get_bun_service "$alias")
+      # Create apps directory structure for bun service
+      local app_dir="$(get_compose_home)/${project_name}/apps/${alias}"
+      ssh_exec "mkdir -p \"${app_dir}\""
+      echo "[INFO] Created app directory on VPS: ${app_dir}"
+      service_config=$(get_bun_service "$project_name" "$alias")
       ;;
     mysql)
       service_config=$(get_mysql_service "$alias")
@@ -228,27 +241,39 @@ add_service() {
   
   # Download compose file, modify locally, upload back
   local temp_file=$(mktemp)
+  local service_temp=$(mktemp)
   ssh_exec "cat \"${compose_file}\"" > "$temp_file"
   
+  # Write service config to temp file
+  echo "$service_config" > "$service_temp"
+  
   # Create backup on VPS
-  ssh_exec "cp \"${compose_file}\" \"${compose_file}.backup.\$(date +%Y%m%d_%H%M%S)\""
+  local backup_file="/tmp/docker-compose.backup.$(date +%Y%m%d_%H%M%S).yml"
+  ssh_exec "cp \"${compose_file}\" \"${backup_file}\""
+  echo "[INFO] Backup created on VPS at: ${backup_file}"
   
   # Add service before the networks section
   if grep -q "^networks:" "$temp_file"; then
     # Insert before networks section
-    awk -v service="$service_config" '
+    awk -v service_file="$service_temp" '
       /^networks:/ {
-        print service
+        while ((getline line < service_file) > 0) {
+          print line
+        }
+        close(service_file)
         print ""
       }
       { print }
     ' "$temp_file" > "${temp_file}.tmp"
   else
     # Append to services section
-    awk -v service="$service_config" '
+    awk -v service_file="$service_temp" '
       /^services:/ { print; next }
       /^[a-z]/ && !/^services:/ { 
-        print service
+        while ((getline line < service_file) > 0) {
+          print line
+        }
+        close(service_file)
         print ""
         print
         next
@@ -258,7 +283,7 @@ add_service() {
   fi
   
   # Add volumes section for MySQL if needed
-  if [ "${service_type,,}" = "mysql" ]; then
+  if [ "$service_type_lower" = "mysql" ]; then
     if ! grep -q "^volumes:" "${temp_file}.tmp"; then
       echo "" >> "${temp_file}.tmp"
       echo "volumes:" >> "${temp_file}.tmp"
@@ -277,14 +302,160 @@ add_service() {
   
   # Upload modified file back to VPS
   ssh_exec "cat > \"${compose_file}\"" < "${temp_file}.tmp"
-  rm -f "$temp_file" "${temp_file}.tmp"
+  rm -f "$temp_file" "${temp_file}.tmp" "$service_temp"
   
   echo "[OK] Service '${alias}' added successfully on VPS"
   echo "[INFO] Review and customize on VPS: ${compose_file}"
   
-  if [ "${service_type,,}" = "mysql" ]; then
+  if [ "$service_type_lower" = "mysql" ]; then
     echo "[WARN] Remember to change MySQL passwords in docker-compose.yml on VPS"
   fi
+}
+
+# ======================
+# FUNCTION: CLONE REPO
+# ======================
+clone_repo() {
+  local project_name="$1"
+  local alias="$2"
+  local clone_url="$3"
+  
+  if [ -z "$project_name" ] || [ -z "$alias" ] || [ -z "$clone_url" ]; then
+    echo "[ERROR] Project name, container alias, and clone URL are required"
+    usage
+  fi
+  
+  local compose_home="$(get_compose_home)"
+  local app_dir="${compose_home}/${project_name}/apps/${alias}"
+  
+  # Check if it's already a git repository
+  if ssh_exec_quiet "[ -d \"${app_dir}/.git\" ]"; then
+    echo "[WARN] Git repository already exists on VPS: ${app_dir}"
+    echo "[INFO] If you want to re-clone, remove the directory first"
+    exit 1
+  fi
+  
+  # If directory exists but isn't a git repo, remove it
+  if ssh_exec_quiet "[ -d \"${app_dir}\" ]"; then
+    echo "[INFO] Removing existing non-git directory: ${app_dir}"
+    ssh_exec "rm -rf \"${app_dir}\""
+  fi
+  
+  echo "[INFO] Cloning repository into ${app_dir} on VPS"
+  
+  # Ensure GitHub host key is in known_hosts (if using GitHub)
+  if echo "$clone_url" | grep -q "github.com"; then
+    ssh_exec "ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true"
+  fi
+  
+  # Create parent directories and clone
+  ssh_exec "mkdir -p \"$(dirname "${app_dir}")\""
+  ssh_exec "git clone \"${clone_url}\" \"${app_dir}\""
+  
+  echo "[OK] Repository cloned successfully to: ${app_dir}"
+}
+
+# ======================
+# FUNCTION: RESTART PROJECT
+# ======================
+restart_project() {
+  local project_name="$1"
+  
+  if [ -z "$project_name" ]; then
+    echo "[ERROR] Project name is required"
+    usage
+  fi
+  
+  local project_dir="$(get_compose_home)/${project_name}"
+  local compose_file="${project_dir}/docker-compose.yml"
+  
+  # Check if project exists on VPS
+  if ssh_exec_quiet "[ ! -d \"${project_dir}\" ]"; then
+    echo "[ERROR] Project directory does not exist on VPS: ${project_dir}"
+    echo "[INFO] Initialize it first with: $0 init $project_name"
+    exit 1
+  fi
+  
+  if ssh_exec_quiet "[ ! -f \"${compose_file}\" ]"; then
+    echo "[ERROR] docker-compose.yml not found on VPS: ${compose_file}"
+    exit 1
+  fi
+  
+  echo "[INFO] Restarting docker-compose project '${project_name}' on VPS"
+  
+  # Restart the compose project
+  ssh_exec "cd \"${project_dir}\" && docker compose restart"
+  
+  echo "[OK] Project '${project_name}' restarted successfully"
+}
+
+# ======================
+# FUNCTION: UP PROJECT
+# ======================
+up_project() {
+  local project_name="$1"
+  
+  if [ -z "$project_name" ]; then
+    echo "[ERROR] Project name is required"
+    usage
+  fi
+  
+  local project_dir="$(get_compose_home)/${project_name}"
+  local compose_file="${project_dir}/docker-compose.yml"
+  
+  # Check if project exists on VPS
+  if ssh_exec_quiet "[ ! -d \"${project_dir}\" ]"; then
+    echo "[ERROR] Project directory does not exist on VPS: ${project_dir}"
+    echo "[INFO] Initialize it first with: $0 init $project_name"
+    exit 1
+  fi
+  
+  if ssh_exec_quiet "[ ! -f \"${compose_file}\" ]"; then
+    echo "[ERROR] docker-compose.yml not found on VPS: ${compose_file}"
+    exit 1
+  fi
+  
+  echo "[INFO] Starting docker-compose project '${project_name}' on VPS"
+  
+  # Start the compose project (volumes persist from previous runs)
+  ssh_exec "cd \"${project_dir}\" && docker compose up -d"
+  
+  echo "[OK] Project '${project_name}' started successfully"
+}
+
+# ======================
+# FUNCTION: DOWN PROJECT
+# ======================
+down_project() {
+  local project_name="$1"
+  
+  if [ -z "$project_name" ]; then
+    echo "[ERROR] Project name is required"
+    usage
+  fi
+  
+  local project_dir="$(get_compose_home)/${project_name}"
+  local compose_file="${project_dir}/docker-compose.yml"
+  
+  # Check if project exists on VPS
+  if ssh_exec_quiet "[ ! -d \"${project_dir}\" ]"; then
+    echo "[ERROR] Project directory does not exist on VPS: ${project_dir}"
+    echo "[INFO] Initialize it first with: $0 init $project_name"
+    exit 1
+  fi
+  
+  if ssh_exec_quiet "[ ! -f \"${compose_file}\" ]"; then
+    echo "[ERROR] docker-compose.yml not found on VPS: ${compose_file}"
+    exit 1
+  fi
+  
+  echo "[INFO] Stopping docker-compose project '${project_name}' on VPS"
+  echo "[INFO] Note: Volumes will persist and can be reused on next 'up'"
+  
+  # Stop and remove containers/networks, but keep volumes
+  ssh_exec "cd \"${project_dir}\" && docker compose down"
+  
+  echo "[OK] Project '${project_name}' stopped successfully"
 }
 
 # ======================
@@ -311,6 +482,34 @@ case "$COMMAND" in
       usage
     fi
     add_service "$1" "$2" "$3"
+    ;;
+  clone)
+    if [ $# -lt 3 ]; then
+      echo "[ERROR] Project name, container alias, and clone URL required"
+      usage
+    fi
+    clone_repo "$1" "$2" "$3"
+    ;;
+  up)
+    if [ $# -lt 1 ]; then
+      echo "[ERROR] Project name required"
+      usage
+    fi
+    up_project "$1"
+    ;;
+  down)
+    if [ $# -lt 1 ]; then
+      echo "[ERROR] Project name required"
+      usage
+    fi
+    down_project "$1"
+    ;;
+  restart)
+    if [ $# -lt 1 ]; then
+      echo "[ERROR] Project name required"
+      usage
+    fi
+    restart_project "$1"
     ;;
   *)
     echo "[ERROR] Unknown command: $COMMAND"

@@ -10,9 +10,11 @@ Run the following commands:
 
 ```bash
 bin/provision
-ssh phantom # Wait 1-2 minutes before testing SSH login (disconnect after success)
+# Wait 1-2 minutes before proceeding as the VPS reboots
 bin/audit
 bin/compose init pme
 bin/compose add pme mysql db
-bin/compose add pme bun app
+bin/compose add pme bun bot
+bin/compose clone pme bot git@github.com:archan937/sim-racer.git
+bin/compose up pme
 ```
