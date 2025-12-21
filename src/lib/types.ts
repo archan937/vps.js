@@ -127,6 +127,7 @@ export interface DockerComposeService {
   image?: string;
   container_name?: string;
   user?: string;
+  userns_mode?: string;
   working_dir?: string;
   volumes?: string[];
   command?: string | string[];

@@ -59,8 +59,9 @@ async function getBunService(
   return {
     image: "oven/bun:latest",
     container_name: alias,
+    userns_mode: "host",
     working_dir: "/app",
-    volumes: [`${appDir}:/app`, `${alias}_node_modules:/app/node_modules`],
+    volumes: [`${appDir}:/app`, `/app/node_modules`],
     command: ["bun", "run", "--watch", "src/index.ts"],
     networks: ["default"],
     restart: "unless-stopped",
@@ -415,11 +416,6 @@ async function addService(
   // Add volumes for MySQL if needed
   if (serviceTypeLower === "mysql") {
     composeConfig.volumes[`${alias}_data`] = {};
-  }
-
-  // Add volumes for Bun services if needed
-  if (serviceTypeLower === "bun") {
-    composeConfig.volumes[`${alias}_node_modules`] = {};
   }
 
   // Ensure networks section exists
