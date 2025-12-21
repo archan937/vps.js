@@ -5,7 +5,7 @@ It is designed to be **idempotent**, **minimal**, and **safe to re-run**.
 
 ## Features
 
-- Creates a non-root user (`paul`) with sudo access
+- Creates a non-root user with sudo access
 - Hardens SSH:
   - Disables root login
   - Disables password authentication
@@ -21,16 +21,16 @@ It is designed to be **idempotent**, **minimal**, and **safe to re-run**.
 
 ### Quick Start (Recommended)
 
-From your local machine, run the following command to copy your SSH key, execute the script, and provision the server in one step:
+Configure `bin/.env` accordingly and from your local machine, run the following command to copy your SSH key, execute the script, and provision the server in one step:
 
 ```bash
-ssh-copy-id -i ~/.ssh/id_rsa.pub root@SERVER && ssh root@SERVER 'bash -s' < <(sed "s/\r$//" provision.sh)
+ssh-copy-id -i ~/.ssh/id_rsa.pub root@SERVER && ssh root@SERVER 'bash -s' < <(sed "s/\r$//" bin/provision)
 ```
 
 After provisioning completes, log in as the new user:
 
 ```bash
-ssh paul@SERVER
+ssh user@SERVER
 ```
 
 ## Run a security audit against the provisioned VPS
@@ -38,7 +38,7 @@ ssh paul@SERVER
 Run the following command:
 
 ```bash
-./audit.sh
+bin/audit
 ```
 
 ## Notes

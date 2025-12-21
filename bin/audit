@@ -1,12 +1,31 @@
 #!/bin/bash
 # VPS Security Audit Script (run from macOS)
-# Usage: ./audit.sh paul phantom
+# Usage: ./audit.sh [user] [host]
 # Requires: ssh, optional: nmap
 
 set -euo pipefail
 
-SSH_USER="${1:-paul}"
-VPS_HOST="${2:-phantom}"
+# ======================
+# LOAD CONFIG FROM .env
+# ======================
+if [ -f "$(dirname "$0")/.env" ]; then
+  # shellcheck source=/dev/null
+  source "$(dirname "$0")/.env"
+fi
+
+# Command line args override .env
+SSH_USER="${1:-${VPS_USER:-}}"
+VPS_HOST="${2:-${VPS_HOST:-}}"
+
+if [ -z "$SSH_USER" ]; then
+  echo "[ERROR] SSH user is required. Set VPS_USER in .env or pass as first argument."
+  exit 1
+fi
+
+if [ -z "$VPS_HOST" ]; then
+  echo "[ERROR] VPS host is required. Set VPS_HOST in .env or pass as second argument."
+  exit 1
+fi
 
 # SSH options to suppress MOTD and banners
 # Note: PrintMotd is not available on all SSH clients, so we filter MOTD in parsing

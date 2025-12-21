@@ -5,11 +5,34 @@
 set -euo pipefail
 
 # ======================
+# LOAD CONFIG FROM .env (if available)
+# ======================
+if [ -f "$(dirname "$0")/.env" ]; then
+  # shellcheck source=/dev/null
+  source "$(dirname "$0")/.env"
+fi
+
+# ======================
 # CONFIG
 # ======================
-USERNAME="paul"
-HOSTNAME="phantom"
-TIMEZONE="Europe/Amsterdam"
+USERNAME="${VPS_USER:-}"
+HOSTNAME="${VPS_HOSTNAME:-}"
+TIMEZONE="${VPS_TIMEZONE:-}"
+
+if [ -z "$USERNAME" ]; then
+  echo "[ERROR] VPS_USER is required. Set VPS_USER in .env file."
+  exit 1
+fi
+
+if [ -z "$HOSTNAME" ]; then
+  echo "[ERROR] VPS_HOSTNAME is required. Set VPS_HOSTNAME in .env file."
+  exit 1
+fi
+
+if [ -z "$TIMEZONE" ]; then
+  echo "[ERROR] VPS_TIMEZONE is required. Set VPS_TIMEZONE in .env file."
+  exit 1
+fi
 
 # ======================
 # FUNCTION: WAIT FOR APT LOCK (with timeout)
@@ -97,7 +120,8 @@ echo "[INFO] Hardening SSH..."
 SSH_CONFIG="/etc/ssh/sshd_config"
 
 # Backup original config
-cp "$SSH_CONFIG" "${SSH_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
+SSH_BACKUP="${SSH_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
+cp "$SSH_CONFIG" "$SSH_BACKUP"
 
 # Function to set SSH option (handles commented lines and existing settings)
 set_ssh_option() {
@@ -161,7 +185,7 @@ if sshd -t; then
   fi
 else
   echo "[ERROR] SSH config test failed. Restoring backup..."
-  cp "${SSH_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)" "$SSH_CONFIG" 2>/dev/null || true
+  cp "$SSH_BACKUP" "$SSH_CONFIG" 2>/dev/null || true
   echo "[WARN] SSH config test failed. Skipping restart. Please fix manually."
 fi
 
@@ -272,8 +296,9 @@ fi
 # ======================
 echo "[INFO] Installing Docker Compose..."
 COMPOSE_BIN="/usr/local/bin/docker-compose"
-COMPOSE_VERSION="$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f4)"
-if [ ! -f "$COMPOSE_BIN" ] || ! "$($COMPOSE_BIN --version 2>/dev/null | grep -q "$COMPOSE_VERSION")"; then
+COMPOSE_VERSION="$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f4 | sed 's/^v//')"
+INSTALLED_VERSION=$($COMPOSE_BIN --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+if [ ! -f "$COMPOSE_BIN" ] || [ "$INSTALLED_VERSION" != "$COMPOSE_VERSION" ]; then
   curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o "$COMPOSE_BIN"
   chmod +x "$COMPOSE_BIN"
 fi

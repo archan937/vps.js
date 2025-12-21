@@ -1,0 +1,308 @@
+#!/bin/bash
+# Docker Compose Project Management Script for VPS
+# Run from local machine to manage docker-compose projects on VPS
+
+set -euo pipefail
+
+# ======================
+# LOAD CONFIG FROM .env
+# ======================
+if [ -f "$(dirname "$0")/.env" ]; then
+  # shellcheck source=/dev/null
+  source "$(dirname "$0")/.env"
+fi
+
+# ======================
+# CONFIG
+# ======================
+VPS_HOST="${VPS_HOST:-}"
+VPS_USER="${VPS_USER:-}"
+COMPOSE_HOME="~"
+
+# ======================
+# FUNCTION: EXECUTE ON VPS
+# ======================
+ssh_exec() {
+  if [ -z "$VPS_HOST" ]; then
+    echo "[ERROR] VPS_HOST is required. Set VPS_HOST in .env or export VPS_HOST environment variable."
+    exit 1
+  fi
+  
+  if [ -z "$VPS_USER" ]; then
+    echo "[ERROR] VPS_USER is required. Set VPS_USER in .env or export VPS_USER environment variable."
+    exit 1
+  fi
+  
+  ssh "${VPS_USER}@${VPS_HOST}" "$@"
+}
+
+# ======================
+# FUNCTION: EXECUTE ON VPS (QUIET)
+# ======================
+ssh_exec_quiet() {
+  ssh_exec "$@" >/dev/null 2>&1
+}
+
+# ======================
+# FUNCTION: PRINT USAGE
+# ======================
+usage() {
+  cat <<EOF
+Usage: $0 <command> [arguments]
+
+Environment Variables:
+  VPS_HOST          VPS hostname or IP (required)
+  VPS_USER          VPS username (required)
+
+Commands:
+  init <name>                    Initialize a new docker-compose project
+  add <project> <type> <alias>   Add a container to a project
+                                 Types: bun, mysql
+
+Examples:
+  export VPS_HOST=192.168.1.100
+  $0 init myapp
+  $0 add myapp bun app
+  $0 add myapp mysql db
+EOF
+  exit 1
+}
+
+# ======================
+# FUNCTION: INIT PROJECT
+# ======================
+init_project() {
+  local project_name="$1"
+  
+  if [ -z "$project_name" ]; then
+    echo "[ERROR] Project name is required"
+    usage
+  fi
+  
+  local project_dir="${COMPOSE_HOME}/${project_name}"
+  
+  # Check if directory exists on VPS
+  if ssh_exec_quiet "[ -d \"${project_dir}\" ]"; then
+    echo "[WARN] Project directory already exists on VPS: ${project_dir}"
+    exit 1
+  fi
+  
+  echo "[INFO] Initializing docker-compose project on VPS: $project_name"
+  
+  # Create directory and docker-compose.yml on VPS
+  ssh_exec "mkdir -p \"${project_dir}\""
+  
+  ssh_exec "cat > \"${project_dir}/docker-compose.yml\"" <<EOF
+version: '3.8'
+
+services:
+  # Add your services here using: $0 add $project_name <type> <alias>
+
+networks:
+  default:
+    name: ${project_name}_network
+
+EOF
+  
+  echo "[OK] Project initialized on VPS at: ${project_dir}"
+  echo "[INFO] You can now add services using: $0 add $project_name <type> <alias>"
+}
+
+# ======================
+# FUNCTION: GET BUN SERVICE CONFIG
+# ======================
+get_bun_service() {
+  local alias="$1"
+  cat <<EOF
+  ${alias}:
+    image: oven/bun:latest
+    container_name: ${alias}
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: bun run --watch src/index.ts
+    networks:
+      - default
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=development
+EOF
+}
+
+# ======================
+# FUNCTION: GET MYSQL SERVICE CONFIG
+# ======================
+get_mysql_service() {
+  local alias="$1"
+  local db_name="${alias}_db"
+  local root_password="root_password_change_me"
+  local user="${alias}_user"
+  local password="user_password_change_me"
+  
+  cat <<EOF
+  ${alias}:
+    image: mysql:8.0
+    container_name: ${alias}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${root_password}
+      MYSQL_DATABASE: ${db_name}
+      MYSQL_USER: ${user}
+      MYSQL_PASSWORD: ${password}
+    volumes:
+      - ${alias}_data:/var/lib/mysql
+    networks:
+      - default
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+EOF
+}
+
+# ======================
+# FUNCTION: ADD SERVICE TO COMPOSE
+# ======================
+add_service() {
+  local project_name="$1"
+  local service_type="$2"
+  local alias="$3"
+  
+  if [ -z "$project_name" ] || [ -z "$service_type" ] || [ -z "$alias" ]; then
+    echo "[ERROR] Project name, service type, and alias are required"
+    usage
+  fi
+  
+  local project_dir="${COMPOSE_HOME}/${project_name}"
+  local compose_file="${project_dir}/docker-compose.yml"
+  
+  # Check if project exists on VPS
+  if ssh_exec_quiet "[ ! -d \"${project_dir}\" ]"; then
+    echo "[ERROR] Project directory does not exist on VPS: ${project_dir}"
+    echo "[INFO] Initialize it first with: $0 init $project_name"
+    exit 1
+  fi
+  
+  if ssh_exec_quiet "[ ! -f \"${compose_file}\" ]"; then
+    echo "[ERROR] docker-compose.yml not found on VPS: ${compose_file}"
+    exit 1
+  fi
+  
+  # Check if service already exists
+  if ssh_exec "grep -q \"^  ${alias}:\" \"${compose_file}\""; then
+    echo "[WARN] Service '$alias' already exists in docker-compose.yml"
+    exit 1
+  fi
+  
+  echo "[INFO] Adding ${service_type} service '${alias}' to project '${project_name}' on VPS"
+  
+  # Get service config based on type
+  local service_config=""
+  case "${service_type,,}" in
+    bun)
+      service_config=$(get_bun_service "$alias")
+      ;;
+    mysql)
+      service_config=$(get_mysql_service "$alias")
+      ;;
+    *)
+      echo "[ERROR] Unknown service type: $service_type"
+      echo "[INFO] Supported types: bun, mysql"
+      exit 1
+      ;;
+  esac
+  
+  # Download compose file, modify locally, upload back
+  local temp_file=$(mktemp)
+  ssh_exec "cat \"${compose_file}\"" > "$temp_file"
+  
+  # Create backup on VPS
+  ssh_exec "cp \"${compose_file}\" \"${compose_file}.backup.\$(date +%Y%m%d_%H%M%S)\""
+  
+  # Add service before the networks section
+  if grep -q "^networks:" "$temp_file"; then
+    # Insert before networks section
+    awk -v service="$service_config" '
+      /^networks:/ {
+        print service
+        print ""
+      }
+      { print }
+    ' "$temp_file" > "${temp_file}.tmp"
+  else
+    # Append to services section
+    awk -v service="$service_config" '
+      /^services:/ { print; next }
+      /^[a-z]/ && !/^services:/ { 
+        print service
+        print ""
+        print
+        next
+      }
+      { print }
+    ' "$temp_file" > "${temp_file}.tmp"
+  fi
+  
+  # Add volumes section for MySQL if needed
+  if [ "${service_type,,}" = "mysql" ]; then
+    if ! grep -q "^volumes:" "${temp_file}.tmp"; then
+      echo "" >> "${temp_file}.tmp"
+      echo "volumes:" >> "${temp_file}.tmp"
+      echo "  ${alias}_data:" >> "${temp_file}.tmp"
+    elif ! grep -q "  ${alias}_data:" "${temp_file}.tmp"; then
+      # Add volume entry before networks
+      awk -v vol="  ${alias}_data:" '
+        /^networks:/ {
+          print vol
+        }
+        { print }
+      ' "${temp_file}.tmp" > "${temp_file}.tmp2"
+      mv "${temp_file}.tmp2" "${temp_file}.tmp"
+    fi
+  fi
+  
+  # Upload modified file back to VPS
+  ssh_exec "cat > \"${compose_file}\"" < "${temp_file}.tmp"
+  rm -f "$temp_file" "${temp_file}.tmp"
+  
+  echo "[OK] Service '${alias}' added successfully on VPS"
+  echo "[INFO] Review and customize on VPS: ${compose_file}"
+  
+  if [ "${service_type,,}" = "mysql" ]; then
+    echo "[WARN] Remember to change MySQL passwords in docker-compose.yml on VPS"
+  fi
+}
+
+# ======================
+# MAIN
+# ======================
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+COMMAND="$1"
+shift || true
+
+case "$COMMAND" in
+  init)
+    if [ $# -lt 1 ]; then
+      echo "[ERROR] Project name required"
+      usage
+    fi
+    init_project "$1"
+    ;;
+  add)
+    if [ $# -lt 3 ]; then
+      echo "[ERROR] Project name, service type, and alias required"
+      usage
+    fi
+    add_service "$1" "$2" "$3"
+    ;;
+  *)
+    echo "[ERROR] Unknown command: $COMMAND"
+    usage
+    ;;
+esac
