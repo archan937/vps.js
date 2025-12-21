@@ -17,7 +17,18 @@ fi
 # ======================
 VPS_HOST="${VPS_HOST:-}"
 VPS_USER="${VPS_USER:-}"
-COMPOSE_HOME="~"
+
+# Get remote HOME directory (cached after first call)
+get_compose_home() {
+  if [ -z "${_COMPOSE_HOME_CACHE:-}" ]; then
+    if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ]; then
+      echo "[ERROR] VPS_HOST and VPS_USER must be set" >&2
+      exit 1
+    fi
+    _COMPOSE_HOME_CACHE=$(ssh_exec "echo \$HOME")
+  fi
+  echo "$_COMPOSE_HOME_CACHE"
+}
 
 # ======================
 # FUNCTION: EXECUTE ON VPS
@@ -79,7 +90,7 @@ init_project() {
     usage
   fi
   
-  local project_dir="${COMPOSE_HOME}/${project_name}"
+  local project_dir="$(get_compose_home)/${project_name}"
   
   # Check if directory exists on VPS
   if ssh_exec_quiet "[ -d \"${project_dir}\" ]"; then
@@ -176,7 +187,7 @@ add_service() {
     usage
   fi
   
-  local project_dir="${COMPOSE_HOME}/${project_name}"
+  local project_dir="$(get_compose_home)/${project_name}"
   local compose_file="${project_dir}/docker-compose.yml"
   
   # Check if project exists on VPS
