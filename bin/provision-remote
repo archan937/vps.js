@@ -84,6 +84,26 @@ chmod 700 /home/$USERNAME/.ssh
 chmod 600 /home/$USERNAME/.ssh/authorized_keys
 
 # ======================
+# VERIFY SSH KEY SETUP BEFORE HARDENING
+# ======================
+echo "[INFO] Verifying SSH key setup for $USERNAME..."
+if [ ! -f "/home/$USERNAME/.ssh/authorized_keys" ]; then
+  echo "[ERROR] SSH authorized_keys file does not exist!"
+  echo "[ERROR] Cannot proceed with SSH hardening - you would be locked out."
+  echo "[ERROR] Please ensure root's authorized_keys exists and contains your public key."
+  exit 1
+fi
+
+if [ ! -s "/home/$USERNAME/.ssh/authorized_keys" ]; then
+  echo "[ERROR] SSH authorized_keys file is empty!"
+  echo "[ERROR] Cannot proceed with SSH hardening - you would be locked out."
+  exit 1
+fi
+
+echo "[OK] SSH authorized_keys file exists and contains keys"
+echo "[INFO] Proceeding with SSH hardening (password auth will be disabled)..."
+
+# ======================
 # PASSWORDLESS SUDO
 # ======================
 echo "[INFO] Setting up passwordless sudo for $USERNAME..."

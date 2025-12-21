@@ -30,7 +30,7 @@ bin/provision
 After provisioning completes, log in as the new user:
 
 ```bash
-ssh user@SERVER
+ssh SERVER
 ```
 
 ## Run a security audit against the provisioned VPS

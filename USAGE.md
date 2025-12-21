@@ -10,7 +10,7 @@ Run the following commands:
 
 ```bash
 bin/provision
-ssh phantom     # Just for SSH login testing (disconnect after success)
+ssh phantom # Wait 1-2 minutes before testing SSH login (disconnect after success)
 bin/audit
 bin/compose init pme
 bin/compose add pme mysql db

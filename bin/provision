@@ -19,6 +19,7 @@ VPS_HOST="${VPS_HOST:-}"
 VPS_USER="${VPS_USER:-}"
 VPS_HOSTNAME="${VPS_HOSTNAME:-}"
 VPS_TIMEZONE="${VPS_TIMEZONE:-}"
+VPS_SSH_PUBKEY="${VPS_SSH_PUBKEY:-}"
 
 if [ -z "$VPS_HOST" ]; then
   echo "[ERROR] VPS_HOST is required. Set VPS_HOST in .env file."
@@ -40,6 +41,11 @@ if [ -z "$VPS_TIMEZONE" ]; then
   exit 1
 fi
 
+if [ -z "$VPS_SSH_PUBKEY" ]; then
+  echo "[ERROR] VPS_SSH_PUBKEY is required. Set VPS_SSH_PUBKEY in .env file."
+  exit 1
+fi
+
 # ======================
 # SSH TO VPS AND EXECUTE PROVISIONING
 # ======================
@@ -47,4 +53,5 @@ echo "[INFO] Connecting to VPS: $VPS_HOST"
 echo "[INFO] Executing provisioning script on VPS..."
 
 REMOTE_SCRIPT="$(dirname "$0")/provision-remote"
-ssh root@"$VPS_HOST" "VPS_USER='$VPS_USER' VPS_HOSTNAME='$VPS_HOSTNAME' VPS_TIMEZONE='$VPS_TIMEZONE' bash -s" < "$REMOTE_SCRIPT"
+ssh-copy-id -i "$VPS_SSH_PUBKEY" root@"$VPS_HOST"
+ssh root@"$VPS_HOST" "VPS_USER=$VPS_USER VPS_HOSTNAME=$VPS_HOSTNAME VPS_TIMEZONE=$VPS_TIMEZONE bash -s" < "$REMOTE_SCRIPT"
