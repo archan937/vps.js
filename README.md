@@ -72,28 +72,63 @@ bin/compose add myapp bun app
 bin/compose add myapp mysql db
 ```
 
-### Clone a Git repository
-
-Clone a repository into a project's app directory:
-
-```bash
-bin/compose clone <project> <alias> <url>
-```
-
-Example:
-
-```bash
-bin/compose clone myapp app https://github.com/user/repo.git
-```
-
 ### Manage project lifecycle
 
-Start, stop, or restart a docker-compose project:
+Start, stop, restart, or execute commands in a docker-compose project:
 
 ```bash
 bin/compose up <project>
 bin/compose down <project>
 bin/compose restart <project>
+bin/compose exec <project> <alias> <command>
+```
+
+Example:
+
+```bash
+bin/compose exec myapp app bun install
+```
+
+## Manage Git repositories in compose projects
+
+The `bin/git` command helps you manage Git repositories within your docker-compose projects:
+
+### Clone a Git repository
+
+Clone a repository into a project's app directory:
+
+```bash
+bin/git clone <project> <alias> <url>
+```
+
+Example:
+
+```bash
+bin/git clone myapp app https://github.com/user/repo.git
+```
+
+### Pull latest changes
+
+```bash
+bin/git pull <project> <alias>
+```
+
+### List branches
+
+```bash
+bin/git branch <project> <alias>
+```
+
+### Checkout a branch or commit
+
+```bash
+bin/git checkout <project> <alias> <ref>
+```
+
+Example:
+
+```bash
+bin/git checkout myapp app main
 ```
 
 **Note:** All commands require `VPS_HOST` and `VPS_USER` environment variables (or configuration in `bin/.env`).
@@ -101,3 +136,4 @@ bin/compose restart <project>
 ## Notes
 
 - Root SSH login is disabled after provisioning.
+- Suited for Ubuntu 20.04 and 22.04 LTS

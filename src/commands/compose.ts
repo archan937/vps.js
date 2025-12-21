@@ -7,28 +7,7 @@ import {
   sshExecStdout,
   filterMOTDFromOutput,
 } from "../lib/ssh.js";
-import type { ServiceType } from "../lib/types.js";
-
-// Cache for remote HOME directory
-let composeHomeCache: string | null = null;
-
-/**
- * Get remote HOME directory (cached after first call)
- */
-async function getComposeHome(config: {
-  vpsHost: string;
-  vpsUser: string;
-}): Promise<string> {
-  if (!composeHomeCache) {
-    const result = await sshExecStdout("echo $HOME", {
-      host: config.vpsHost,
-      user: config.vpsUser,
-      agentForward: true,
-    });
-    composeHomeCache = filterMOTDFromOutput(result);
-  }
-  return composeHomeCache;
-}
+import { getComposeHome } from "../lib/compose.js";
 
 /**
  * Print usage information
@@ -44,18 +23,18 @@ Commands:
   init <name>                    Initialize a new docker-compose project
   add <project> <type> <alias>   Add a container to a project
                                  Types: bun, mysql
-  clone <project> <alias> <url>  Clone a Git repository into ~/apps/<project>/apps/<alias>
   up <project>                   Start a docker-compose project
   down <project>                 Stop and remove a docker-compose project
   restart <project>              Restart a docker-compose project
+  exec <project> <alias> <cmd>   Execute a command in a container
 
 Examples:
   export VPS_HOST=192.168.1.100
   bin/compose init myapp
   bin/compose add myapp bun app
   bin/compose add myapp mysql db
-  bin/compose clone myapp app https://github.com/user/repo.git
   bin/compose up myapp
+  bin/compose exec myapp app bun install
   bin/compose down myapp
   bin/compose restart myapp`);
   process.exit(1);
@@ -64,18 +43,41 @@ Examples:
 /**
  * Get Bun service configuration
  */
-function getBunService(
+async function getBunService(
   projectName: string,
   alias: string,
-  composeHome: string
-): string {
+  composeHome: string,
+  config: { vpsHost: string; vpsUser: string }
+): Promise<string> {
   const appDir = `${composeHome}/${projectName}/apps/${alias}`;
+
+  // Get the UID and GID of the VPS user to set proper permissions
+  const uidResult = await sshExecStdout(`id -u`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+  const gidResult = await sshExecStdout(`id -g`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+
+  const uid = filterMOTDFromOutput(uidResult).trim();
+  const gid = filterMOTDFromOutput(gidResult).trim();
+
+  if (!uid || !gid) {
+    throw new Error("Failed to get UID/GID from VPS");
+  }
+
   return `  ${alias}:
     image: oven/bun:latest
     container_name: ${alias}
+    user: "${uid}:${gid}"
     working_dir: /app
     volumes:
       - ${appDir}:/app
+      - ${alias}_node_modules:/app/node_modules
     command: bun run --watch src/index.ts
     networks:
       - default
@@ -177,6 +179,31 @@ networks:
 }
 
 /**
+ * Add a named volume to the docker-compose.yml lines if it doesn't already exist
+ */
+function ensureVolumeInCompose(newLines: string[], volumeName: string): void {
+  const formattedVolumeName = `  ${volumeName}:`;
+  const hasVolumes = newLines.some((l) => l.trim() === "volumes:");
+  const hasVolume = newLines.some((l) => l.trim() === formattedVolumeName);
+
+  if (!hasVolumes) {
+    // Find networks section and insert volumes before it
+    const networksIndex = newLines.findIndex((l) => l.trim() === "networks:");
+    if (networksIndex !== -1) {
+      newLines.splice(networksIndex, 0, "", "volumes:", formattedVolumeName);
+    } else {
+      newLines.push("", "volumes:", formattedVolumeName);
+    }
+  } else if (!hasVolume) {
+    // Find volumes section and add volume
+    const volumesIndex = newLines.findIndex((l) => l.trim() === "volumes:");
+    if (volumesIndex !== -1) {
+      newLines.splice(volumesIndex + 1, 0, formattedVolumeName);
+    }
+  }
+}
+
+/**
  * Add a service to a docker-compose project
  */
 async function addService(
@@ -248,7 +275,12 @@ async function addService(
       agentForward: true,
     });
     log.info(`Created app directory on VPS: ${appDir}`);
-    serviceConfig = getBunService(projectName, alias, composeHome);
+    serviceConfig = await getBunService(
+      projectName,
+      alias,
+      composeHome,
+      config
+    );
   } else if (serviceTypeLower === "mysql") {
     serviceConfig = getMysqlService(alias);
   } else {
@@ -338,25 +370,12 @@ async function addService(
 
   // Add volumes section for MySQL if needed
   if (serviceTypeLower === "mysql") {
-    const volumeName = `  ${alias}_data:`;
-    const hasVolumes = newLines.some((l) => l.trim() === "volumes:");
-    const hasVolume = newLines.some((l) => l.trim() === volumeName);
+    ensureVolumeInCompose(newLines, `${alias}_data`);
+  }
 
-    if (!hasVolumes) {
-      // Find networks section and insert volumes before it
-      const networksIndex = newLines.findIndex((l) => l.trim() === "networks:");
-      if (networksIndex !== -1) {
-        newLines.splice(networksIndex, 0, "", "volumes:", volumeName);
-      } else {
-        newLines.push("", "volumes:", volumeName);
-      }
-    } else if (!hasVolume) {
-      // Find volumes section and add volume
-      const volumesIndex = newLines.findIndex((l) => l.trim() === "volumes:");
-      if (volumesIndex !== -1) {
-        newLines.splice(volumesIndex + 1, 0, volumeName);
-      }
-    }
+  // Add volumes section for Bun services if needed
+  if (serviceTypeLower === "bun") {
+    ensureVolumeInCompose(newLines, `${alias}_node_modules`);
   }
 
   const newContent = newLines.join("\n");
@@ -381,79 +400,98 @@ async function addService(
 }
 
 /**
- * Clone a Git repository
+ * Execute a command in a container
  */
-async function cloneRepo(
+async function execProject(
   projectName: string,
   alias: string,
-  cloneUrl: string,
+  command: string,
   config: { vpsHost: string; vpsUser: string }
 ): Promise<void> {
-  if (!projectName || !alias || !cloneUrl) {
-    log.error("Project name, container alias, and clone URL are required");
+  if (!projectName || !alias || !command) {
+    log.error("Project name, container alias, and command are required");
     usage();
   }
 
   const composeHome = await getComposeHome(config);
-  const appDir = `${composeHome}/${projectName}/apps/${alias}`;
+  const projectDir = `${composeHome}/${projectName}`;
+  const composeFile = `${projectDir}/docker-compose.yml`;
 
-  // Check if it's already a git repository
-  const gitExists = await sshExecQuiet(`[ -d "${appDir}/.git" ]`, {
+  // Check if project exists
+  const dirExists = await sshExecQuiet(`[ -d "${projectDir}" ]`, {
     host: config.vpsHost,
     user: config.vpsUser,
     agentForward: true,
   });
 
-  if (gitExists.success) {
-    log.warn(`Git repository already exists on VPS: ${appDir}`);
-    log.info("If you want to re-clone, remove the directory first");
+  if (!dirExists.success) {
+    log.error(`Project directory does not exist on VPS: ${projectDir}`);
+    log.info(`Initialize it first with: bin/compose init ${projectName}`);
     process.exit(1);
   }
 
-  // If directory exists but isn't a git repo, remove it
-  const dirExists = await sshExecQuiet(`[ -d "${appDir}" ]`, {
+  const fileExists = await sshExecQuiet(`[ -f "${composeFile}" ]`, {
     host: config.vpsHost,
     user: config.vpsUser,
     agentForward: true,
   });
 
-  if (dirExists.success) {
-    log.info(`Removing existing non-git directory: ${appDir}`);
-    await sshExec(`rm -rf "${appDir}"`, {
+  if (!fileExists.success) {
+    log.error(`docker-compose.yml not found on VPS: ${composeFile}`);
+    process.exit(1);
+  }
+
+  // Check if container is running
+  const containerRunning = await sshExecQuiet(
+    `cd "${projectDir}" && docker compose ps -q ${alias} | grep -q .`,
+    {
       host: config.vpsHost,
       user: config.vpsUser,
       agentForward: true,
-    });
+    }
+  );
+
+  if (!containerRunning.success) {
+    log.error(`Container '${alias}' is not running`);
+    log.info(`Start it first with: bin/compose up ${projectName}`);
+    process.exit(1);
   }
 
-  log.info(`Cloning repository into ${appDir} on VPS`);
+  // Try to fix permissions for Bun services before executing
+  const isBunService = await sshExec(
+    `grep -A 5 "^  ${alias}:" "${composeFile}" | grep -q "oven/bun"`,
+    {
+      host: config.vpsHost,
+      user: config.vpsUser,
+      agentForward: true,
+    }
+  );
 
-  // Ensure GitHub host key is in known_hosts (if using GitHub)
-  if (cloneUrl.includes("github.com")) {
-    await sshExec(
-      "ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true",
-      {
-        host: config.vpsHost,
-        user: config.vpsUser,
-        agentForward: true,
-      }
-    );
+  log.info(
+    `Executing command in container '${alias}' of project '${projectName}'`
+  );
+
+  // Execute command
+  const result = await sshExec(
+    `cd "${projectDir}" && docker compose exec -T ${alias} ${command}`,
+    {
+      host: config.vpsHost,
+      user: config.vpsUser,
+      agentForward: true,
+    }
+  );
+
+  if (result.stdout) {
+    log.raw(result.stdout);
+  }
+  if (result.stderr) {
+    log.raw(result.stderr);
   }
 
-  // Create parent directories and clone
-  await sshExec(`mkdir -p "$(dirname "${appDir}")"`, {
-    host: config.vpsHost,
-    user: config.vpsUser,
-    agentForward: true,
-  });
-
-  await sshExec(`git clone "${cloneUrl}" "${appDir}"`, {
-    host: config.vpsHost,
-    user: config.vpsUser,
-    agentForward: true,
-  });
-
-  log.ok(`Repository cloned successfully to: ${appDir}`);
+  // Exit with the same code as the command
+  if (!result.success) {
+    process.exit(result.exitCode ?? 1);
+  }
 }
 
 /**
@@ -647,13 +685,14 @@ async function downProject(
 }
 
 /**
- * Main entry point
+ * Main compose function
  */
-async function main(): Promise<void> {
+async function compose(): Promise<void> {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
     usage();
+    return;
   }
 
   const config = await loadAndValidateVPSConfig(["vpsHost", "vpsUser"]);
@@ -684,14 +723,6 @@ async function main(): Promise<void> {
         );
         break;
 
-      case "clone":
-        if (commandArgs.length < 3) {
-          log.error("Project name, container alias, and clone URL required");
-          usage();
-        }
-        await cloneRepo(commandArgs[0], commandArgs[1], commandArgs[2], config);
-        break;
-
       case "up":
         if (commandArgs.length < 1) {
           log.error("Project name required");
@@ -716,6 +747,16 @@ async function main(): Promise<void> {
         await restartProject(commandArgs[0], config);
         break;
 
+      case "exec":
+        if (commandArgs.length < 3) {
+          log.error("Project name, container alias, and command required");
+          usage();
+        }
+        // Join all remaining args as the command to execute
+        const execCommand = commandArgs.slice(2).join(" ");
+        await execProject(commandArgs[0], commandArgs[1], execCommand, config);
+        break;
+
       default:
         log.error(`Unknown command: ${command}`);
         usage();
@@ -730,4 +771,12 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+// Run compose command
+compose().catch((error) => {
+  log.error(
+    `Compose command failed: ${
+      error instanceof Error ? error.message : String(error)
+    }`
+  );
+  process.exit(1);
+});

@@ -155,7 +155,11 @@ function parseListeningPorts(ssOutput: string): {
 /**
  * Main audit function
  */
-async function runAudit(user?: string, host?: string): Promise<void> {
+async function audit(): Promise<void> {
+  const args = process.argv.slice(2);
+  const user = args[0];
+  const host = args[1];
+
   // Load config and allow command-line overrides
   const baseConfig = await loadVPSConfig();
   const config = getConfigWithOverrides(baseConfig, {
@@ -747,12 +751,10 @@ systemctl is-active --quiet ntp 2>/dev/null && echo "NTP_ACTIVE" || echo "NTP_IN
   }
 }
 
-// Main entry point
-const args = process.argv.slice(2);
-const user = args[0];
-const host = args[1];
-
-runAudit(user, host).catch((error) => {
-  log.error(`Audit failed: ${error.message}`);
+// Run audit
+audit().catch((error) => {
+  log.error(
+    `Audit failed: ${error instanceof Error ? error.message : String(error)}`
+  );
   process.exit(1);
 });
