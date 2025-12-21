@@ -109,3 +109,49 @@ export interface ExposedPort {
   process?: string;
   bindAddress: string;
 }
+
+/**
+ * Docker Compose configuration structure
+ */
+export interface DockerComposeConfig {
+  version?: string;
+  services?: Record<string, DockerComposeService>;
+  networks?: Record<string, DockerComposeNetwork>;
+  volumes?: Record<string, DockerComposeVolume>;
+}
+
+/**
+ * Docker Compose service configuration
+ */
+export interface DockerComposeService {
+  image?: string;
+  container_name?: string;
+  user?: string;
+  working_dir?: string;
+  volumes?: string[];
+  command?: string | string[];
+  networks?: string[];
+  restart?: string;
+  environment?: Record<string, string> | string[];
+  ports?: string[];
+  healthcheck?: {
+    test: string[];
+    interval?: string;
+    timeout?: string;
+    retries?: number;
+  };
+}
+
+/**
+ * Docker Compose network configuration
+ */
+export interface DockerComposeNetwork {
+  name?: string;
+}
+
+/**
+ * Docker Compose volume configuration
+ */
+export interface DockerComposeVolume {
+  // Named volumes are typically empty objects
+}

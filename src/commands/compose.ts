@@ -8,6 +8,11 @@ import {
   filterMOTDFromOutput,
 } from "../lib/ssh.js";
 import { getComposeHome } from "../lib/compose.js";
+import type {
+  DockerComposeConfig,
+  DockerComposeService,
+} from "../lib/types.js";
+import yaml from "yaml";
 
 /**
  * Print usage information
@@ -41,80 +46,103 @@ Examples:
 }
 
 /**
- * Get Bun service configuration
+ * Get Bun service configuration as an object
  */
 async function getBunService(
   projectName: string,
   alias: string,
   composeHome: string,
   config: { vpsHost: string; vpsUser: string }
-): Promise<string> {
+): Promise<DockerComposeService> {
   const appDir = `${composeHome}/${projectName}/apps/${alias}`;
 
-  // Get the UID and GID of the VPS user to set proper permissions
-  const uidResult = await sshExecStdout(`id -u`, {
-    host: config.vpsHost,
-    user: config.vpsUser,
-    agentForward: true,
-  });
-  const gidResult = await sshExecStdout(`id -g`, {
-    host: config.vpsHost,
-    user: config.vpsUser,
-    agentForward: true,
-  });
-
-  const uid = filterMOTDFromOutput(uidResult).trim();
-  const gid = filterMOTDFromOutput(gidResult).trim();
-
-  if (!uid || !gid) {
-    throw new Error("Failed to get UID/GID from VPS");
-  }
-
-  return `  ${alias}:
-    image: oven/bun:latest
-    container_name: ${alias}
-    user: "${uid}:${gid}"
-    working_dir: /app
-    volumes:
-      - ${appDir}:/app
-      - ${alias}_node_modules:/app/node_modules
-    command: bun run --watch src/index.ts
-    networks:
-      - default
-    restart: unless-stopped
-    environment:
-      - NODE_ENV=development`;
+  return {
+    image: "oven/bun:latest",
+    container_name: alias,
+    working_dir: "/app",
+    volumes: [`${appDir}:/app`, `${alias}_node_modules:/app/node_modules`],
+    command: ["bun", "run", "--watch", "src/index.ts"],
+    networks: ["default"],
+    restart: "unless-stopped",
+    environment: {
+      NODE_ENV: "development",
+    },
+  };
 }
 
 /**
- * Get MySQL service configuration
+ * Get MySQL service configuration as an object
  */
-function getMysqlService(alias: string): string {
+function getMysqlService(alias: string): DockerComposeService {
   const dbName = `${alias}_db`;
   const rootPassword = "root_password_change_me";
   const user = `${alias}_user`;
   const password = "user_password_change_me";
 
-  return `  ${alias}:
-    image: mysql:8.0
-    container_name: ${alias}
-    environment:
-      MYSQL_ROOT_PASSWORD: ${rootPassword}
-      MYSQL_DATABASE: ${dbName}
-      MYSQL_USER: ${user}
-      MYSQL_PASSWORD: ${password}
-    volumes:
-      - ${alias}_data:/var/lib/mysql
-    networks:
-      - default
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:3306:3306"
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5`;
+  return {
+    image: "mysql:8.0",
+    container_name: alias,
+    environment: {
+      MYSQL_ROOT_PASSWORD: rootPassword,
+      MYSQL_DATABASE: dbName,
+      MYSQL_USER: user,
+      MYSQL_PASSWORD: password,
+    },
+    volumes: [`${alias}_data:/var/lib/mysql`],
+    networks: ["default"],
+    restart: "unless-stopped",
+    ports: ["127.0.0.1:3306:3306"],
+    healthcheck: {
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"],
+      interval: "10s",
+      timeout: "5s",
+      retries: 5,
+    },
+  };
+}
+
+/**
+ * Add this helper to prepare the config for YAML output with inline arrays
+ */
+function prepareConfigForYaml(
+  config: DockerComposeConfig
+): DockerComposeConfig {
+  // Deep clone to avoid mutating original
+  const prepared = JSON.parse(JSON.stringify(config)) as DockerComposeConfig;
+
+  // Recursively process services to mark arrays for inline formatting
+  if (prepared.services) {
+    for (const serviceName in prepared.services) {
+      const service = prepared.services[serviceName];
+      if (service) {
+        // Ensure command is an array (already is, but ensure it's marked)
+        if (service.command && Array.isArray(service.command)) {
+          // Keep as array - yaml.stringify will handle it
+        }
+        // Ensure healthcheck.test is an array
+        if (
+          service.healthcheck?.test &&
+          Array.isArray(service.healthcheck.test)
+        ) {
+          // Keep as array
+        }
+      }
+    }
+  }
+
+  // Ensure all volumes are empty objects
+  if (prepared.volumes) {
+    for (const volumeName in prepared.volumes) {
+      if (
+        prepared.volumes[volumeName] === null ||
+        prepared.volumes[volumeName] === undefined
+      ) {
+        prepared.volumes[volumeName] = {};
+      }
+    }
+  }
+
+  return prepared;
 }
 
 /**
@@ -153,14 +181,97 @@ async function initProject(
     agentForward: true,
   });
 
-  // Create docker-compose.yml
-  const composeContent = `services:
-  # Add your services here using: bin/compose add ${projectName} <type> <alias>
+  // Build docker-compose object
+  const composeConfig: DockerComposeConfig = {
+    services: {},
+    networks: {
+      default: {
+        name: `${projectName}_network`,
+      },
+    },
+  };
 
-networks:
-  default:
-    name: ${projectName}_network
-`;
+  const preparedConfig = prepareConfigForYaml(composeConfig);
+
+  // Convert to YAML - use custom formatting
+  let composeContent = yaml.stringify(preparedConfig, {
+    indent: 2,
+    lineWidth: 0,
+    minContentWidth: 0,
+    simpleKeys: false,
+    defaultStringType: "QUOTE_DOUBLE",
+    defaultKeyType: "PLAIN",
+  });
+
+  // Post-process to make command and healthcheck.test arrays inline
+  // This is the ONLY string manipulation we need - just for formatting preference
+  composeContent = composeContent.replace(
+    /^(\s+command:\s*\n)((?:\s+- [^\n]+\n)+)/gm,
+    (match, before, items) => {
+      const itemLines = items
+        .split("\n")
+        .filter((l: string) => l.trim().startsWith("-"))
+        .map((l: string) => {
+          let item = l.trim().substring(1).trim();
+          if (item.startsWith('"') && item.endsWith('"')) return item;
+          if (item.includes(" ") || item.includes(":")) return `"${item}"`;
+          return item;
+        });
+      const indent = before.match(/(\s+)command:/)?.[1] || "      ";
+      return `${indent}command: [${itemLines.join(", ")}]\n`;
+    }
+  );
+
+  composeContent = composeContent.replace(
+    /^(\s+healthcheck:\s*\n(?:\s+[^\s:]+:[^\n]*\n)*)\s+test:\s*\n((?:\s+- [^\n]+\n)+)/gm,
+    (match, before, items) => {
+      const itemLines = items
+        .split("\n")
+        .filter((l: string) => l.trim().startsWith("-"))
+        .map((l: string) => {
+          let item = l.trim().substring(1).trim();
+          if (item.startsWith('"') && item.endsWith('"')) return item;
+          if (item.includes(" ") || item.includes(":")) return `"${item}"`;
+          return item;
+        });
+      return `${before}      test: [${itemLines.join(", ")}]\n`;
+    }
+  );
+
+  // Ensure volumes are {} not null
+  composeContent = composeContent.replace(/^(\s+\w+):\s*null\s*$/gm, "$1:");
+
+  // Remove empty object syntax (: {}) and replace with just colon
+  composeContent = composeContent.replace(/^(\s+\w+):\s*\{\}\s*$/gm, "$1:");
+
+  // Add blank lines between services (only in services section, not volumes/networks)
+  const lines = composeContent.split("\n");
+  let inServicesSection = false;
+  let firstService = true;
+  const processedLines = lines.map((line, index) => {
+    if (line.trim() === "services:") {
+      inServicesSection = true;
+      firstService = true;
+      return line;
+    }
+    if (line.trim() === "volumes:" || line.trim() === "networks:") {
+      inServicesSection = false;
+      return line;
+    }
+    if (inServicesSection && /^  \w+:\s*$/.test(line)) {
+      if (firstService) {
+        firstService = false;
+        return line;
+      }
+      return `\n${line}`;
+    }
+    return line;
+  });
+  composeContent = processedLines.join("\n");
+
+  // Add blank lines between major sections
+  composeContent = composeContent.replace(/^volumes:\s*$/gm, "\nvolumes:");
+  composeContent = composeContent.replace(/^networks:\s*$/gm, "\nnetworks:");
 
   await sshExec(
     `cat > "${projectDir}/docker-compose.yml"`,
@@ -176,31 +287,6 @@ networks:
   log.info(
     `You can now add services using: bin/compose add ${projectName} <type> <alias>`
   );
-}
-
-/**
- * Add a named volume to the docker-compose.yml lines if it doesn't already exist
- */
-function ensureVolumeInCompose(newLines: string[], volumeName: string): void {
-  const formattedVolumeName = `  ${volumeName}:`;
-  const hasVolumes = newLines.some((l) => l.trim() === "volumes:");
-  const hasVolume = newLines.some((l) => l.trim() === formattedVolumeName);
-
-  if (!hasVolumes) {
-    // Find networks section and insert volumes before it
-    const networksIndex = newLines.findIndex((l) => l.trim() === "networks:");
-    if (networksIndex !== -1) {
-      newLines.splice(networksIndex, 0, "", "volumes:", formattedVolumeName);
-    } else {
-      newLines.push("", "volumes:", formattedVolumeName);
-    }
-  } else if (!hasVolume) {
-    // Find volumes section and add volume
-    const volumesIndex = newLines.findIndex((l) => l.trim() === "volumes:");
-    if (volumesIndex !== -1) {
-      newLines.splice(volumesIndex + 1, 0, formattedVolumeName);
-    }
-  }
 }
 
 /**
@@ -245,17 +331,36 @@ async function addService(
     process.exit(1);
   }
 
-  // Check if service already exists
-  const serviceExists = await sshExec(
-    `grep -q "^  ${alias}:" "${composeFile}"`,
-    {
-      host: config.vpsHost,
-      user: config.vpsUser,
-      agentForward: true,
-    }
-  );
+  // Download compose file
+  const composeContent = await sshExecStdout(`cat "${composeFile}"`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
 
-  if (serviceExists.success) {
+  // Parse YAML to object
+  let composeConfig: DockerComposeConfig;
+  try {
+    composeConfig = yaml.parse(composeContent) as DockerComposeConfig;
+    if (!composeConfig || typeof composeConfig !== "object") {
+      throw new Error("Invalid docker-compose.yml structure");
+    }
+  } catch (error) {
+    log.error(
+      `Failed to parse docker-compose.yml: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    process.exit(1);
+  }
+
+  // Ensure services object exists
+  if (!composeConfig.services) {
+    composeConfig.services = {};
+  }
+
+  // Check if service already exists
+  if (composeConfig.services[alias]) {
     log.warn(`Service '${alias}' already exists in docker-compose.yml`);
     process.exit(1);
   }
@@ -265,7 +370,7 @@ async function addService(
   );
 
   const serviceTypeLower = serviceType.toLowerCase();
-  let serviceConfig = "";
+  let serviceConfig: DockerComposeService;
 
   if (serviceTypeLower === "bun") {
     const appDir = `${composeHome}/${projectName}/apps/${alias}`;
@@ -289,12 +394,42 @@ async function addService(
     process.exit(1);
   }
 
-  // Download compose file
-  const composeContent = await sshExecStdout(`cat "${composeFile}"`, {
-    host: config.vpsHost,
-    user: config.vpsUser,
-    agentForward: true,
-  });
+  // Add service to config
+  composeConfig.services[alias] = serviceConfig;
+
+  // Ensure volumes section exists
+  if (!composeConfig.volumes) {
+    composeConfig.volumes = {};
+  }
+
+  // Ensure all existing volumes are empty objects, not null
+  for (const volumeName in composeConfig.volumes) {
+    if (
+      composeConfig.volumes[volumeName] === null ||
+      composeConfig.volumes[volumeName] === undefined
+    ) {
+      composeConfig.volumes[volumeName] = {};
+    }
+  }
+
+  // Add volumes for MySQL if needed
+  if (serviceTypeLower === "mysql") {
+    composeConfig.volumes[`${alias}_data`] = {};
+  }
+
+  // Add volumes for Bun services if needed
+  if (serviceTypeLower === "bun") {
+    composeConfig.volumes[`${alias}_node_modules`] = {};
+  }
+
+  // Ensure networks section exists
+  if (!composeConfig.networks) {
+    composeConfig.networks = {
+      default: {
+        name: `${projectName}_network`,
+      },
+    };
+  }
 
   // Create backup
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
@@ -306,79 +441,85 @@ async function addService(
   });
   log.info(`Backup created on VPS at: ${backupFile}`);
 
-  // Parse and modify YAML
-  const lines = composeContent.split("\n");
-  const newLines: string[] = [];
-  let inServices = false;
-  let servicesEnded = false;
-  let currentIndent = 0;
-  let lastServiceEndIndex = -1;
+  // Convert object back to YAML
+  const preparedConfig = prepareConfigForYaml(composeConfig);
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
-    const lineIndent = line.length - line.trimStart().length;
+  let newContent = yaml.stringify(preparedConfig, {
+    indent: 2,
+    lineWidth: 0,
+    minContentWidth: 0,
+    simpleKeys: false,
+    defaultStringType: "QUOTE_DOUBLE",
+    defaultKeyType: "PLAIN",
+  });
 
-    // Track when we're in the services section
-    if (trimmed === "services:") {
-      inServices = true;
-      newLines.push(line);
-      continue;
+  // Same post-processing as initProject
+  newContent = newContent.replace(
+    /^(\s+command:\s*\n)((?:\s+- [^\n]+\n)+)/gm,
+    (match, before, items) => {
+      const itemLines = items
+        .split("\n")
+        .filter((l: string) => l.trim().startsWith("-"))
+        .map((l: string) => {
+          let item = l.trim().substring(1).trim();
+          if (item.startsWith('"') && item.endsWith('"')) return item;
+          if (item.includes(" ") || item.includes(":")) return `"${item}"`;
+          return item;
+        });
+      const indent = before.match(/(\s+)command:/)?.[1] || "      ";
+      return `${indent}command: [${itemLines.join(", ")}]\n`;
     }
+  );
 
-    // Check if we've left the services section (top-level key with no indent)
-    if (inServices && lineIndent === 0 && trimmed && !trimmed.startsWith("#")) {
-      // This is a top-level key after services, insert our service before it
-      if (!servicesEnded) {
-        newLines.push(serviceConfig);
-        newLines.push("");
-        servicesEnded = true;
+  newContent = newContent.replace(
+    /^(\s+healthcheck:\s*\n(?:\s+[^\s:]+:[^\n]*\n)*)\s+test:\s*\n((?:\s+- [^\n]+\n)+)/gm,
+    (match, before, items) => {
+      const itemLines = items
+        .split("\n")
+        .filter((l: string) => l.trim().startsWith("-"))
+        .map((l: string) => {
+          let item = l.trim().substring(1).trim();
+          if (item.startsWith('"') && item.endsWith('"')) return item;
+          if (item.includes(" ") || item.includes(":")) return `"${item}"`;
+          return item;
+        });
+      return `${before}      test: [${itemLines.join(", ")}]\n`;
+    }
+  );
+
+  newContent = newContent.replace(/^(\s+\w+):\s*null\s*$/gm, "$1: {}");
+
+  // Remove empty object syntax (: {}) and replace with just colon
+  newContent = newContent.replace(/^(\s+\w+):\s*\{\}\s*$/gm, "$1:");
+
+  // Add blank lines between services (only in services section, not volumes/networks)
+  const lines = newContent.split("\n");
+  let inServicesSection = false;
+  let firstService = true;
+  const processedLines = lines.map((line, index) => {
+    if (line.trim() === "services:") {
+      inServicesSection = true;
+      firstService = true;
+      return line;
+    }
+    if (line.trim() === "volumes:" || line.trim() === "networks:") {
+      inServicesSection = false;
+      return line;
+    }
+    if (inServicesSection && /^  \w+:\s*$/.test(line)) {
+      if (firstService) {
+        firstService = false;
+        return line;
       }
-      inServices = false;
+      return `\n${line}`;
     }
+    return line;
+  });
+  newContent = processedLines.join("\n");
 
-    // Track the end of the last service (before top-level sections)
-    if (inServices && trimmed && lineIndent === 0 && !servicesEnded) {
-      lastServiceEndIndex = i;
-    }
-
-    newLines.push(line);
-  }
-
-  // If we're still in services section or no top-level sections found
-  if (!servicesEnded) {
-    if (lastServiceEndIndex !== -1) {
-      // Insert after the last service
-      newLines.splice(lastServiceEndIndex + 1, 0, serviceConfig, "");
-    } else {
-      // Find services: line and insert after it
-      const servicesIndex = newLines.findIndex((l) => l.trim() === "services:");
-      if (servicesIndex !== -1) {
-        // Find first non-comment, non-empty line after services:
-        let insertIndex = servicesIndex + 1;
-        while (
-          insertIndex < newLines.length &&
-          (newLines[insertIndex]?.trim() === "" ||
-            newLines[insertIndex]?.trim().startsWith("#"))
-        ) {
-          insertIndex++;
-        }
-        newLines.splice(insertIndex, 0, serviceConfig, "");
-      }
-    }
-  }
-
-  // Add volumes section for MySQL if needed
-  if (serviceTypeLower === "mysql") {
-    ensureVolumeInCompose(newLines, `${alias}_data`);
-  }
-
-  // Add volumes section for Bun services if needed
-  if (serviceTypeLower === "bun") {
-    ensureVolumeInCompose(newLines, `${alias}_node_modules`);
-  }
-
-  const newContent = newLines.join("\n");
+  // Add blank lines between major sections
+  newContent = newContent.replace(/^volumes:\s*$/gm, "\nvolumes:");
+  newContent = newContent.replace(/^networks:\s*$/gm, "\nnetworks:");
 
   // Upload modified file
   await sshExec(
