@@ -340,9 +340,37 @@ echo
 echo "[INFO] Checking for listening services..."
 LISTENING=$(ssh $SSH_OPTS "$SSH_USER@$VPS_HOST" "sudo ss -tulpen 2>/dev/null" || echo "")
 if [ -n "$LISTENING" ]; then
-  echo "$LISTENING"
+  # Extract and display open ports summary (informational only)
+  echo "[INFO] Open ports:"
+  OPEN_PORTS=$(echo "$LISTENING" | awk '/LISTEN/ {
+    # Extract port from address:port field
+    if (match($0, /:[0-9]+/)) {
+      port_str = substr($0, RSTART+1, RLENGTH-1)
+      port = port_str
+      # Extract protocol
+      if ($1 ~ /^tcp/) proto = "TCP"
+      else if ($1 ~ /^udp/) proto = "UDP"
+      else proto = toupper($1)
+      # Extract process name if available
+      if (match($0, /users:\(\([^)]+\)/)) {
+        proc_str = substr($0, RSTART+7, RLENGTH-7)
+        gsub(/".*"/, "", proc_str)
+        proc = proc_str
+        printf "  %s:%s (%s)\n", proto, port, proc
+      } else {
+        printf "  %s:%s\n", proto, port
+      }
+    }
+  }' | sort -t: -k2 -n | uniq)
+  
+  if [ -n "$OPEN_PORTS" ]; then
+    echo "$OPEN_PORTS"
+  else
+    echo "  (none found)"
+  fi
+  echo
+  
   # Count non-SSH listening ports, excluding common system services (DNS, NTP)
-  # Use awk to count unique LISTEN lines excluding ports 22, 53, 123
   NON_SSH_COUNT=$(echo "$LISTENING" | awk '/LISTEN/ && !/:22[^0-9]/ && !/:53[^0-9]/ && !/:123[^0-9]/ {count++} END {print count+0}')
   if [ "${NON_SSH_COUNT:-0}" -eq 0 ]; then
     check_pass "Only SSH and essential system services (DNS, NTP) are listening"
