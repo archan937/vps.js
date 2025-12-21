@@ -24,7 +24,7 @@ It is designed to be **idempotent**, **minimal**, and **safe to re-run**.
 Configure `bin/.env` accordingly and from your local machine, run the following command to copy your SSH key, execute the script, and provision the server in one step:
 
 ```bash
-ssh-copy-id -i ~/.ssh/id_rsa.pub root@SERVER && ssh root@SERVER 'bash -s' < <(sed "s/\r$//" bin/provision)
+bin/provision
 ```
 
 After provisioning completes, log in as the new user:
