@@ -47,8 +47,57 @@ Run the following command:
 bin/audit
 ```
 
+## Manage docker-compose projects on the VPS
+
+The `bin/compose` command helps you manage docker-compose projects on your provisioned VPS:
+
+### Initialize a new project
+
+```bash
+bin/compose init <project-name>
+```
+
+### Add services to a project
+
+Supported service types: `bun`, `mysql`
+
+```bash
+bin/compose add <project> <type> <alias>
+```
+
+Examples:
+
+```bash
+bin/compose add myapp bun app
+bin/compose add myapp mysql db
+```
+
+### Clone a Git repository
+
+Clone a repository into a project's app directory:
+
+```bash
+bin/compose clone <project> <alias> <url>
+```
+
+Example:
+
+```bash
+bin/compose clone myapp app https://github.com/user/repo.git
+```
+
+### Manage project lifecycle
+
+Start, stop, or restart a docker-compose project:
+
+```bash
+bin/compose up <project>
+bin/compose down <project>
+bin/compose restart <project>
+```
+
+**Note:** All commands require `VPS_HOST` and `VPS_USER` environment variables (or configuration in `bin/.env`).
+
 ## Notes
 
 - Root SSH login is disabled after provisioning.
-- SSH key installation is handled externally (see Quick Start).
-- Suited for Ubuntu 20.04 and 22.04 LTS
