@@ -21,6 +21,12 @@ It is designed to be **idempotent**, **minimal**, and **safe to re-run**.
 
 ### Quick Start (Recommended)
 
+Install Bun dependencies:
+
+```bash
+bun install
+```
+
 Configure `bin/.env` accordingly and from your local machine, run the following command to copy your SSH key, execute the script, and provision the server in one step:
 
 ```bash
