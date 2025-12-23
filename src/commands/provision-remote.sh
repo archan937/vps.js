@@ -251,6 +251,29 @@ systemctl enable unattended-upgrades
 systemctl start unattended-upgrades || true
 
 # ======================
+# AUTOJUMP
+# ======================
+echo "[INFO] Installing autojump..."
+wait_for_apt
+apt-get install -y autojump
+
+echo "[INFO] Configuring autojump for $USERNAME..."
+USER_HOME="/home/$USERNAME"
+BASH_RC="$USER_HOME/.bashrc"
+
+if [ -f "$BASH_RC" ]; then
+  if ! grep -q "autojump" "$BASH_RC"; then
+    echo "" >> "$BASH_RC"
+    echo "# Autojump initialization" >> "$BASH_RC"
+    echo ". /usr/share/autojump/autojump.sh 2>/dev/null || . /usr/share/autojump/autojump.bash 2>/dev/null || true" >> "$BASH_RC"
+  fi
+else
+  echo "# Autojump initialization" > "$BASH_RC"
+  echo ". /usr/share/autojump/autojump.sh 2>/dev/null || . /usr/share/autojump/autojump.bash 2>/dev/null || true" >> "$BASH_RC"
+  chown $USERNAME:$USERNAME "$BASH_RC"
+fi
+
+# ======================
 # DOCKER INSTALL
 # ======================
 echo "[INFO] Installing Docker..."
