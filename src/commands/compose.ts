@@ -31,6 +31,8 @@ Commands:
   up <project>                   Start a docker-compose project
   down <project>                 Stop and remove a docker-compose project
   restart <project>              Restart a docker-compose project
+  start <project> <service>      Start a specific service/container
+  stop <project> <service>       Stop a specific service/container
   exec <project> <alias> <cmd>   Execute a command in a container
 
 Examples:
@@ -39,6 +41,8 @@ Examples:
   bin/compose add myapp bun app
   bin/compose add myapp mysql db
   bin/compose up myapp
+  bin/compose start myapp app
+  bin/compose stop myapp app
   bin/compose exec myapp app bun install
   bin/compose down myapp
   bin/compose restart myapp`);
@@ -822,6 +826,144 @@ async function downProject(
 }
 
 /**
+ * Start a specific service in a docker-compose project
+ */
+async function startService(
+  projectName: string,
+  serviceName: string,
+  config: { vpsHost: string; vpsUser: string }
+): Promise<void> {
+  if (!projectName || !serviceName) {
+    log.error("Project name and service name are required");
+    usage();
+  }
+
+  const composeHome = await getComposeHome(config);
+  const projectDir = `${composeHome}/${projectName}`;
+  const composeFile = `${projectDir}/docker-compose.yml`;
+
+  // Check if project exists
+  const dirExists = await sshExecQuiet(`[ -d "${projectDir}" ]`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+
+  if (!dirExists.success) {
+    log.error(`Project directory does not exist on VPS: ${projectDir}`);
+    log.info(`Initialize it first with: bin/compose init ${projectName}`);
+    process.exit(1);
+  }
+
+  const fileExists = await sshExecQuiet(`[ -f "${composeFile}" ]`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+
+  if (!fileExists.success) {
+    log.error(`docker-compose.yml not found on VPS: ${composeFile}`);
+    process.exit(1);
+  }
+
+  log.info(
+    `Starting service '${serviceName}' in project '${projectName}' on VPS`
+  );
+
+  const result = await sshExec(
+    `cd "${projectDir}" && docker compose start ${serviceName}`,
+    {
+      host: config.vpsHost,
+      user: config.vpsUser,
+      agentForward: true,
+    }
+  );
+
+  if (result.stdout) {
+    log.raw(result.stdout);
+  }
+  if (result.stderr) {
+    log.raw(result.stderr);
+  }
+
+  if (!result.success) {
+    log.error(`Failed to start service '${serviceName}'`);
+    process.exit(1);
+  }
+
+  log.ok(`Service '${serviceName}' started successfully`);
+}
+
+/**
+ * Stop a specific service in a docker-compose project
+ */
+async function stopService(
+  projectName: string,
+  serviceName: string,
+  config: { vpsHost: string; vpsUser: string }
+): Promise<void> {
+  if (!projectName || !serviceName) {
+    log.error("Project name and service name are required");
+    usage();
+  }
+
+  const composeHome = await getComposeHome(config);
+  const projectDir = `${composeHome}/${projectName}`;
+  const composeFile = `${projectDir}/docker-compose.yml`;
+
+  // Check if project exists
+  const dirExists = await sshExecQuiet(`[ -d "${projectDir}" ]`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+
+  if (!dirExists.success) {
+    log.error(`Project directory does not exist on VPS: ${projectDir}`);
+    log.info(`Initialize it first with: bin/compose init ${projectName}`);
+    process.exit(1);
+  }
+
+  const fileExists = await sshExecQuiet(`[ -f "${composeFile}" ]`, {
+    host: config.vpsHost,
+    user: config.vpsUser,
+    agentForward: true,
+  });
+
+  if (!fileExists.success) {
+    log.error(`docker-compose.yml not found on VPS: ${composeFile}`);
+    process.exit(1);
+  }
+
+  log.info(
+    `Stopping service '${serviceName}' in project '${projectName}' on VPS`
+  );
+
+  const result = await sshExec(
+    `cd "${projectDir}" && docker compose stop ${serviceName}`,
+    {
+      host: config.vpsHost,
+      user: config.vpsUser,
+      agentForward: true,
+    }
+  );
+
+  if (result.stdout) {
+    log.raw(result.stdout);
+  }
+  if (result.stderr) {
+    log.raw(result.stderr);
+  }
+
+  if (!result.success) {
+    log.error(`Failed to stop service '${serviceName}'`);
+    process.exit(1);
+  }
+
+  log.ok(`Service '${serviceName}' stopped successfully`);
+}
+
+/**
  * Main compose function
  */
 async function compose(): Promise<void> {
@@ -874,6 +1016,22 @@ async function compose(): Promise<void> {
           usage();
         }
         await downProject(commandArgs[0], config);
+        break;
+
+      case "start":
+        if (commandArgs.length < 2) {
+          log.error("Project name and service name required");
+          usage();
+        }
+        await startService(commandArgs[0], commandArgs[1], config);
+        break;
+
+      case "stop":
+        if (commandArgs.length < 2) {
+          log.error("Project name and service name required");
+          usage();
+        }
+        await stopService(commandArgs[0], commandArgs[1], config);
         break;
 
       case "restart":
