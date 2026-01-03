@@ -238,6 +238,8 @@ apt-get install -y \
   software-properties-common \
   fail2ban \
   unattended-upgrades \
+  unzip \
+  vim \
   whois \
   python3-pyasyncore \
   python3-pyinotify
